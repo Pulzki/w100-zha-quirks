@@ -9,6 +9,7 @@ from zigpy.quirks.v2 import CustomDeviceV2, QuirkBuilder
 import zigpy.types as t
 from zigpy.zcl import Cluster, foundation
 from zigpy.zcl.clusters.general import (
+    Basic,
     MultistateInput,
     OnOff,
     PowerConfiguration,
@@ -451,6 +452,38 @@ class W100ManuSpecificCluster(XiaomiAqaraE1Cluster):
         except Exception as e:
             _LOGGER.warning("W100: Failed to sync state: %s", e)
 
+class W100BasicCluster(CustomCluster, Basic):
+    """Basic cluster that handles ReportAttributes as ReadAttributesResponse."""
+
+    async def read_attributes(
+        self, attributes, allow_cache=False, only_cache=False, manufacturer=None
+    ):
+        """Read attributes."""
+        if only_cache:
+            return await super().read_attributes(
+                attributes, allow_cache, only_cache, manufacturer
+            )
+
+        try:
+            results = await self.read_attributes_raw(attributes, manufacturer=manufacturer)
+        except Exception:
+            return await super().read_attributes(
+                attributes, allow_cache, only_cache, manufacturer
+            )
+
+        success = {}
+        failure = {}
+
+        for record in results:
+            if isinstance(record, foundation.Attribute):
+                success[record.attrid] = record.value.value
+            else:
+                if record.status == foundation.Status.SUCCESS:
+                    success[record.attrid] = record.value.value
+                else:
+                    failure[record.attrid] = record.status
+
+        return success, failure
 
 class W100FanCluster(CustomCluster, Fan):
     """Fan cluster that proxies to W100 custom cluster."""
@@ -627,15 +660,16 @@ class XiaomiCustomDeviceV2(CustomDeviceV2):
             return super()._find_zcl_cluster(hdr, packet)
         except KeyError:
             endpoint = self.endpoints[packet.src_ep]
-            if hdr.direction == foundation.Direction.Client:
-                return endpoint.in_clusters[hdr.cluster_id]
+            if hdr.direction == foundation.Direction.Client_to_Server:
+                return endpoint.in_clusters[packet.cluster_id]
             else:
-                return endpoint.out_clusters[hdr.cluster_id]
+                return endpoint.out_clusters[packet.cluster_id]
 
 
 (
     QuirkBuilder("Aqara", "lumi.sensor_ht.agl001")
     .device_class(XiaomiCustomDeviceV2)
+    .replaces(W100BasicCluster)
     .replaces(XiaomiPowerConfiguration)
     .replaces(MultistateInputCluster)
     .replaces(W100TemperatureMeasurement)
