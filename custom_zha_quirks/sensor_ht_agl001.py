@@ -32,7 +32,7 @@ from zhaquirks.const import (
     VALUE,
     ZHA_SEND_EVENT,
 )
-from zhaquirks.xiaomi import XiaomiAqaraE1Cluster, XiaomiPowerConfiguration
+from zhaquirks.xiaomi import XiaomiAqaraE1Cluster, XiaomiPowerConfigurationPercent
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -122,6 +122,7 @@ class W100ManuSpecificCluster(XiaomiAqaraE1Cluster):
         w100_control = foundation.ZCLAttributeDef(id=0xFFF2, type=t.LVBytes, is_manufacturer_specific=True)
         thermostat_mode_switch = foundation.ZCLAttributeDef(id=0xFFF3, type=t.Bool, is_manufacturer_specific=True)
         unknown_df = foundation.ZCLAttributeDef(id=0x00DF, type=t.LVBytes, is_manufacturer_specific=True)
+        diagnostics = foundation.ZCLAttributeDef(id=0x00F7, type=t.LVBytes, is_manufacturer_specific=True)
 
     async def write_attributes(self, attributes, manufacturer=None):
         """Intercept write attributes."""
@@ -153,7 +154,23 @@ class W100ManuSpecificCluster(XiaomiAqaraE1Cluster):
         )
 
     def _update_attribute(self, attrid, value):
-        _LOGGER.debug("W100ManuSpecificCluster: _update_attribute called with attrid=%s, value=%s", attrid, value)
+        value_hex: Optional[str] = None
+        if isinstance(value, (bytes, bytearray, memoryview)):
+            value_hex = bytes(value).hex()
+
+        if value_hex is None:
+            _LOGGER.debug(
+                "W100ManuSpecificCluster: _update_attribute attrid=0x%04X value=%r",
+                int(attrid),
+                value,
+            )
+        else:
+            _LOGGER.debug(
+                "W100ManuSpecificCluster: _update_attribute attrid=0x%04X value=%r hex=%s",
+                int(attrid),
+                value,
+                value_hex,
+            )
         
         if attrid == 0x00F7:
             self._update_battery_from_xiaomi_struct(value)
@@ -175,25 +192,60 @@ class W100ManuSpecificCluster(XiaomiAqaraE1Cluster):
     def _update_battery_from_xiaomi_struct(self, value):
         """Parse Xiaomi struct to extract battery percentage."""
         try:
-            data = value
-            while data and data not in (b"", b"\x00"):
+            if not isinstance(value, (bytes, bytearray, memoryview)):
+                return
+
+            # Aqara W100 / TH-S04D exposes battery from Lumi struct key 102.
+            # In hex, that's 0x66. Some Xiaomi devices use key 0x05 instead.
+            BATTERY_PERCENT_KEY_W100 = 0x66
+            BATTERY_PERCENT_KEY_LEGACY = 0x05
+            BATTERY_VOLTAGE_KEY = 0x01
+
+            voltage_mv: Optional[int] = None
+            battery_percent_66: Optional[int] = None
+            battery_percent_05: Optional[int] = None
+
+            data = bytes(value)
+            while data not in (b"", b"\x00"):
                 tag = data[0]
-                val, data = foundation.TypeValue.deserialize(data[1:])
-                if tag == 0x05:
-                    # Tag 5 is battery percentage (0-100)
-                    # ZHA expects 0-200 (0.5% steps)
-                    battery_pct = val.value
-                    _LOGGER.debug("W100: Parsed battery percentage: %s", battery_pct)
-                    
-                    # Power config is on endpoint 1
-                    ep1 = self.endpoint.device.endpoints.get(1)
-                    if ep1:
-                        power_cluster = ep1.in_clusters.get(PowerConfiguration.cluster_id)
-                        if power_cluster:
-                            power_cluster.update_attribute(
-                                PowerConfiguration.AttributeDefs.battery_percentage_remaining.id,
-                                battery_pct * 2
-                            )
+                svalue, data = foundation.TypeValue.deserialize(data[1:])
+                raw = svalue.value
+
+                if tag == BATTERY_VOLTAGE_KEY and isinstance(raw, int):
+                    _LOGGER.debug("W100: Parsed battery voltage key 0x%02X: %d mV", tag, raw)
+                    voltage_mv = raw
+                elif tag == BATTERY_PERCENT_KEY_W100 and isinstance(raw, int):
+                    _LOGGER.debug("W100: Parsed battery percent key 0x%02X: %d%%", tag, raw)
+                    battery_percent_66 = raw
+                elif tag == BATTERY_PERCENT_KEY_LEGACY and isinstance(raw, int):
+                    # On some devices this is a uint16 and may be in half-percent steps (0-200).
+                    _LOGGER.debug("W100: Parsed battery percent key 0x%02X: %d (raw)", tag, raw)
+                    battery_percent_05 = raw
+
+            # Prefer the W100-specific key 0x66.
+            battery_percent: Optional[int] = battery_percent_66
+
+            # Fallback to legacy key 0x05 only if 0x66 wasn't present.
+            if battery_percent is None and battery_percent_05 is not None:
+                normalized = battery_percent_05
+                if normalized > 100 and normalized <= 200:
+                    normalized = int(round(normalized / 2))
+                battery_percent = max(0, min(100, normalized))
+
+            ep1 = self.endpoint.device.endpoints.get(1)
+            if not ep1:
+                return
+
+            power_cluster = ep1.in_clusters.get(PowerConfiguration.cluster_id)
+            if not power_cluster:
+                return
+
+            # Use the XiaomiPowerConfiguration* helpers when available so scaling is correct.
+            if voltage_mv is not None and hasattr(power_cluster, "battery_reported"):
+                power_cluster.battery_reported(voltage_mv)
+
+            if battery_percent is not None and hasattr(power_cluster, "battery_percent_reported"):
+                power_cluster.battery_percent_reported(battery_percent)
         except Exception as e:
             _LOGGER.warning("W100: Error parsing 0xF7: %s", e)
 
@@ -670,8 +722,7 @@ class XiaomiCustomDeviceV2(CustomDeviceV2):
     QuirkBuilder("Aqara", "lumi.sensor_ht.agl001")
     .device_class(XiaomiCustomDeviceV2)
     .replaces(W100BasicCluster)
-    .replaces(XiaomiPowerConfiguration)
-    .replaces(MultistateInputCluster)
+    .replaces(XiaomiPowerConfigurationPercent)
     .replaces(MultistateInputCluster, endpoint_id=1)
     .replaces(MultistateInputCluster, endpoint_id=2)
     .replaces(MultistateInputCluster, endpoint_id=3)
