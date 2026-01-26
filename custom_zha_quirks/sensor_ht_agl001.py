@@ -1,7 +1,10 @@
 """Quirk for Aqara W100 Climate Sensor with 3 buttons."""
 import asyncio
+from enum import IntEnum
 import logging
 import random
+import struct
+import time
 from typing import Any, List, Optional, Union
 
 from zigpy.profiles import zha
@@ -98,6 +101,12 @@ class W100TemperatureMeasurement(CustomCluster, TemperatureMeasurement):
                     thermostat.recalculate_running_state()
 
 
+class W100ExternalSensorMode(IntEnum):
+    """W100 External Sensor Mode."""
+    internal = 0
+    external = 2
+
+
 class W100ManuSpecificCluster(XiaomiAqaraE1Cluster):
     """Aqara W100 custom cluster."""
 
@@ -118,14 +127,228 @@ class W100ManuSpecificCluster(XiaomiAqaraE1Cluster):
         low_humidity = foundation.ZCLAttributeDef(id=0x016D, type=t.int16s, is_manufacturer_specific=True)
         high_humidity = foundation.ZCLAttributeDef(id=0x016E, type=t.int16s, is_manufacturer_specific=True)
         sampling = foundation.ZCLAttributeDef(id=0x0170, type=t.uint8_t, is_manufacturer_specific=True)
+        sensor = foundation.ZCLAttributeDef(id=0x0172, type=t.uint8_t, is_manufacturer_specific=True)
         auto_hide_middle_line = foundation.ZCLAttributeDef(id=0x0173, type=t.Bool, is_manufacturer_specific=True)
+        external_temperature = foundation.ZCLAttributeDef(id=0x0174, type=t.Single, is_manufacturer_specific=True)
+        external_humidity = foundation.ZCLAttributeDef(id=0x0175, type=t.Single, is_manufacturer_specific=True)
         w100_control = foundation.ZCLAttributeDef(id=0xFFF2, type=t.LVBytes, is_manufacturer_specific=True)
         thermostat_mode_switch = foundation.ZCLAttributeDef(id=0xFFF3, type=t.Bool, is_manufacturer_specific=True)
         unknown_df = foundation.ZCLAttributeDef(id=0x00DF, type=t.LVBytes, is_manufacturer_specific=True)
         diagnostics = foundation.ZCLAttributeDef(id=0x00F7, type=t.LVBytes, is_manufacturer_specific=True)
 
+    _FICTIVE_SENSOR_IEEE = bytes.fromhex("00158d00019d1b98")
+
+    # Default values for external sensor measurements
+    _DEFAULT_EXTERNAL_TEMPERATURE = 20.0
+    _DEFAULT_EXTERNAL_HUMIDITY = 50.0
+
+    def __init__(self, *args, **kwargs):
+        """Initialize the cluster with cached external sensor values."""
+        super().__init__(*args, **kwargs)
+        self._cached_external_temperature = self._DEFAULT_EXTERNAL_TEMPERATURE
+        self._cached_external_humidity = self._DEFAULT_EXTERNAL_HUMIDITY
+        # Initialize the attribute cache with default values
+        self._update_attribute(self.AttributeDefs.external_temperature.id, self._cached_external_temperature)
+        self._update_attribute(self.AttributeDefs.external_humidity.id, self._cached_external_humidity)
+
+    @staticmethod
+    def _lumi_header(counter: int, length: int, action: int) -> bytes:
+        header = [0xAA, 0x71, length + 3, 0x44, counter & 0xFF]
+        integrity = (512 - sum(header)) & 0xFF
+        return bytes(header + [integrity, action & 0xFF, 0x41, length & 0xFF])
+
+    def _normalize_sensor_mode(self, value: Any) -> int:
+        try:
+            v = int(value)
+        except (TypeError, ValueError):
+            return int(W100ExternalSensorMode.internal)
+        if v in (2, 3):
+            return int(W100ExternalSensorMode.external)
+        return int(W100ExternalSensorMode.internal)
+
+    def _device_ieee_bytes(self) -> bytes:
+        # Keep consistent with how this quirk already builds W100 frames.
+        return self.endpoint.device.ieee.serialize()
+
+    async def _write_w100_control_frame(self, payload: bytes) -> None:
+        await super().write_attributes({W100_ATTR: payload}, manufacturer=0x115F)
+
+    async def _set_external_sensor_mode(self, mode: Any) -> None:
+        normalized = self._normalize_sensor_mode(mode)
+
+        device = self._device_ieee_bytes()
+        timestamp = struct.pack(">I", int(time.time()))
+
+        if normalized == int(W100ExternalSensorMode.external):
+            params1 = bytes(
+                list(timestamp)
+                + [0x15]
+                + list(device)
+                + list(self._FICTIVE_SENSOR_IEEE)
+                + [
+                    0x00,
+                    0x02,
+                    0x00,
+                    0x55,
+                    0x15,
+                    0x0A,
+                    0x01,
+                    0x00,
+                    0x00,
+                    0x01,
+                    0x06,
+                    0xE6,
+                    0xB9,
+                    0xBF,
+                    0xE5,
+                    0xBA,
+                    0xA6,
+                    0x00,
+                    0x00,
+                    0x00,
+                    0x00,
+                    0x00,
+                    0x01,
+                    0x02,
+                    0x08,
+                    0x65,
+                ]
+            )
+            params2 = bytes(
+                list(timestamp)
+                + [0x14]
+                + list(device)
+                + list(self._FICTIVE_SENSOR_IEEE)
+                + [
+                    0x00,
+                    0x01,
+                    0x00,
+                    0x55,
+                    0x15,
+                    0x0A,
+                    0x01,
+                    0x00,
+                    0x00,
+                    0x01,
+                    0x06,
+                    0xE6,
+                    0xB8,
+                    0xA9,
+                    0xE5,
+                    0xBA,
+                    0xA6,
+                    0x00,
+                    0x00,
+                    0x00,
+                    0x00,
+                    0x00,
+                    0x01,
+                    0x02,
+                    0x07,
+                    0x63,
+                ]
+            )
+
+            val1 = self._lumi_header(0x12, len(params1), 0x02) + params1
+            val2 = self._lumi_header(0x13, len(params2), 0x02) + params2
+
+            await self._write_w100_control_frame(val1)
+            await self._write_w100_control_frame(val2)
+            
+            # Small delay to ensure mode switch is processed
+            await asyncio.sleep(0.3)
+            await self._send_external_measurement("temperature", self._cached_external_temperature)
+            await asyncio.sleep(0.1)
+            await self._send_external_measurement("humidity", self._cached_external_humidity)
+        else:
+            params1 = timestamp + bytes([0x15]) + device + (b"\x00" * 12)
+            params2 = timestamp + bytes([0x14]) + device + (b"\x00" * 12)
+
+            val1 = self._lumi_header(0x12, len(params1), 0x04) + params1
+            val2 = self._lumi_header(0x13, len(params2), 0x04) + params2
+
+            await self._write_w100_control_frame(val1)
+            await self._write_w100_control_frame(val2)
+        try:
+            await super().read_attributes([self.AttributeDefs.sensor.id], manufacturer=0x115F)
+        except Exception:
+            # Ignore read failures; UI will still reflect the last value written.
+            pass
+
+        self._update_attribute(self.AttributeDefs.sensor.id, normalized)
+
+    async def _send_external_measurement(self, kind: str, value: Any) -> None:
+        sensor_mode = self.get(self.AttributeDefs.sensor.id)
+        if sensor_mode is not None and self._normalize_sensor_mode(sensor_mode) != int(W100ExternalSensorMode.external):
+            _LOGGER.debug("W100: Ignoring %s update while sensor mode is internal", kind)
+            return
+
+        number = float(value)
+        measurement = struct.pack(">f", float(round(number * 100)))
+
+        if kind == "temperature":
+            params = self._FICTIVE_SENSOR_IEEE + bytes([0x00, 0x01, 0x00, 0x55]) + measurement
+        elif kind == "humidity":
+            params = self._FICTIVE_SENSOR_IEEE + bytes([0x00, 0x02, 0x00, 0x55]) + measurement
+        else:
+            raise ValueError(f"Unknown kind: {kind}")
+
+        data = self._lumi_header(0x12, len(params), 0x05) + params
+        await self._write_w100_control_frame(data)
+
     async def write_attributes(self, attributes, manufacturer=None):
         """Intercept write attributes."""
+        if "sensor" in attributes or self.AttributeDefs.sensor.id in attributes:
+            val = attributes.get("sensor", attributes.get(self.AttributeDefs.sensor.id))
+            await self._set_external_sensor_mode(val)
+            return [
+                [
+                    foundation.WriteAttributesStatusRecord(
+                        foundation.Status.SUCCESS,
+                        attrid=self.AttributeDefs.sensor.id,
+                    )
+                ]
+            ]
+
+        if "external_temperature" in attributes or self.AttributeDefs.external_temperature.id in attributes:
+            val = attributes.get(
+                "external_temperature", attributes.get(self.AttributeDefs.external_temperature.id)
+            )
+            # Cache the value for use when switching to external mode
+            self._cached_external_temperature = float(val)
+            _LOGGER.debug("W100: Cached external temperature: %.1f", self._cached_external_temperature)
+            try:
+                await self._send_external_measurement("temperature", val)
+            finally:
+                # Keep last value in cache for the HA UI
+                self._update_attribute(self.AttributeDefs.external_temperature.id, float(val))
+            return [
+                [
+                    foundation.WriteAttributesStatusRecord(
+                        foundation.Status.SUCCESS,
+                        attrid=self.AttributeDefs.external_temperature.id,
+                    )
+                ]
+            ]
+
+        if "external_humidity" in attributes or self.AttributeDefs.external_humidity.id in attributes:
+            val = attributes.get("external_humidity", attributes.get(self.AttributeDefs.external_humidity.id))
+            # Cache the value for use when switching to external mode
+            self._cached_external_humidity = float(val)
+            _LOGGER.debug("W100: Cached external humidity: %.1f", self._cached_external_humidity)
+            try:
+                await self._send_external_measurement("humidity", val)
+            finally:
+                self._update_attribute(self.AttributeDefs.external_humidity.id, float(val))
+            return [
+                [
+                    foundation.WriteAttributesStatusRecord(
+                        foundation.Status.SUCCESS,
+                        attrid=self.AttributeDefs.external_humidity.id,
+                    )
+                ]
+            ]
+
         if "thermostat_mode_switch" in attributes or 0xFFF3 in attributes:
             val = attributes.get("thermostat_mode_switch", attributes.get(0xFFF3))
             mode = "ON" if val else "OFF"
@@ -148,15 +371,54 @@ class W100ManuSpecificCluster(XiaomiAqaraE1Cluster):
         """Read attributes with manufacturer code forced."""
         if manufacturer is None:
             manufacturer = 0x115F
-        
-        return await super().read_attributes(
-            attributes, allow_cache, only_cache, manufacturer
-        )
+
+        # These are virtual config attributes (used only to trigger writes).
+        # Serve them from cache to avoid unsupported attribute reads.
+        virtual_ids = {
+            self.AttributeDefs.external_temperature.id,
+            self.AttributeDefs.external_humidity.id,
+        }
+
+        requested_ids: list[int] = []
+        passthrough: list[Any] = []
+        for attr in attributes:
+            if isinstance(attr, str) and attr in self.attributes_by_name:
+                attr_id = self.attributes_by_name[attr].id
+            elif isinstance(attr, int):
+                attr_id = attr
+            else:
+                passthrough.append(attr)
+                continue
+
+            if attr_id in virtual_ids:
+                requested_ids.append(attr_id)
+            else:
+                passthrough.append(attr)
+
+        success: dict[Any, Any] = {}
+        failure: dict[Any, Any] = {}
+
+        for attr_id in requested_ids:
+            cached = self.get(attr_id)
+            if cached is not None:
+                success[attr_id] = cached
+
+        if passthrough:
+            s, f = await super().read_attributes(
+                passthrough, allow_cache, only_cache, manufacturer
+            )
+            success.update(s)
+            failure.update(f)
+
+        return success, failure
 
     def _update_attribute(self, attrid, value):
         value_hex: Optional[str] = None
         if isinstance(value, (bytes, bytearray, memoryview)):
             value_hex = bytes(value).hex()
+
+        if attrid == self.AttributeDefs.sensor.id:
+            value = self._normalize_sensor_mode(value)
 
         if value_hex is None:
             _LOGGER.debug(
@@ -731,6 +993,36 @@ class XiaomiCustomDeviceV2(CustomDeviceV2):
     .adds(W100ThermostatCluster)
     .adds_endpoint(21, profile_id=zha.PROFILE_ID, device_type=0x0301)
     .adds(W100FanCluster, endpoint_id=21)
+    .enum(
+        "sensor",
+        W100ExternalSensorMode,
+        cluster_id=W100ManuSpecificCluster.cluster_id,
+        endpoint_id=1,
+        translation_key="sensor",
+        fallback_name="Sensor display mode",
+    )
+    .number(
+        "external_temperature",
+        cluster_id=W100ManuSpecificCluster.cluster_id,
+        endpoint_id=1,
+        min_value=-100,
+        max_value=100,
+        step=0.1,
+        unit="°C",
+        translation_key="external_temperature",
+        fallback_name="External temperature",
+    )
+    .number(
+        "external_humidity",
+        cluster_id=W100ManuSpecificCluster.cluster_id,
+        endpoint_id=1,
+        min_value=0,
+        max_value=100,
+        step=0.1,
+        unit="%",
+        translation_key="external_humidity",
+        fallback_name="External humidity",
+    )
     .switch("auto_hide_middle_line", cluster_id=W100ManuSpecificCluster.cluster_id, endpoint_id=1, translation_key="auto_hide_middle_line", fallback_name="Auto Hide Middle Line", on_value=0, off_value=1)
     .switch("thermostat_mode_switch", cluster_id=W100ManuSpecificCluster.cluster_id, endpoint_id=1, translation_key="thermostat_mode_switch", fallback_name="Thermostat Mode Switch")
     .device_automation_triggers({
