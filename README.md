@@ -26,8 +26,6 @@ This custom quirk enables functionality for the Aqara W100 Climate Sensor in Hom
    - Edit your `configuration.yaml` file to include the custom quirks path:
      ```yaml
      zha:
-        database_path: /config/zigbee.db
-        enable_quirks: true
         custom_quirks_path: /config/custom_zha_quirks/ 
      ```
 
