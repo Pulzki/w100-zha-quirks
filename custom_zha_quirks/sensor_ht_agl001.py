@@ -185,7 +185,7 @@ class W100ManuSpecificCluster(XiaomiAqaraE1Cluster):
                 value=t.LVBytes(bytes(payload)),
             ),
         )
-        await self.write_attributes_raw([attr], manufacturer=0x115F)
+        await self.write_attributes_raw([attr], manufacturer_code=0x115F)
 
     async def _set_external_sensor_mode(self, mode: Any) -> None:
         normalized = self._normalize_sensor_mode(mode)
