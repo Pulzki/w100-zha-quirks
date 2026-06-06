@@ -756,12 +756,15 @@ class W100ManuSpecificCluster(XiaomiAqaraE1Cluster):
         except Exception as e:
             _LOGGER.warning("W100: Failed to configure reporting: %s", e)
 
-        # Initialize Mode
+        # Bind the manufacturer cluster so the device reports to us (PMTSD
+        # heartbeats, button events, etc). Do NOT force a thermostat mode here:
+        # apply_custom_configuration runs on every reconfigure, so forcing OFF
+        # (or ON) would override whatever mode the user last set and the device
+        # has persisted. The mode is synced from the device's own PMTSD reports.
         try:
             await self.bind()
-            await self.set_thermostat_mode("OFF")
         except Exception as e:
-            _LOGGER.warning("W100: Failed to set thermostat mode: %s", e)
+            _LOGGER.warning("W100: Failed to bind manufacturer cluster: %s", e)
 
         # Sync state
         try:
@@ -877,7 +880,11 @@ class W100ThermostatCluster(CustomCluster, Thermostat):
     def __init__(self, *args, **kwargs):
         """Initialize the cluster."""
         super().__init__(*args, **kwargs)
-        self._cached_p = 0
+        # Default to off (P=1), consistent with the system_mode=Off seed below.
+        # Until the device reports its real state via a PMTSD data frame, an
+        # off default keeps heartbeat replays suppressed instead of re-enabling
+        # a device the user has turned off.
+        self._cached_p = 1
         self._cached_m = 0
         self._cached_t = 20.0
         self._cached_s = 0
