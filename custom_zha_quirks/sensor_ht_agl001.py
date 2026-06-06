@@ -704,30 +704,26 @@ class W100ManuSpecificCluster(XiaomiAqaraE1Cluster):
             if thermostat and isinstance(thermostat, W100ThermostatCluster):
                 thermostat._cached_p = 1 if mode == "OFF" else 0
 
+        if mode == "ON":
+            # The literal "ON" registration frame is ~60 bytes and exceeds the
+            # device link's single-request limit (~50 bytes). The thermostat is
+            # actually enabled by the PMTSD active frame (P=0), which is small
+            # enough to fit, so replay the cached PMTSD instead. _cached_p was
+            # just set to 0 above, so _send_cached_pmtsd will send it.
+            await self._send_cached_pmtsd()
+            return
+
         device_ieee = self.endpoint.device.ieee
         dev_mac = device_ieee.serialize()
-        hub_mac = bytes.fromhex("54ef4480711a")
 
-        if mode == "ON":
-            prefix = bytes.fromhex("aa713244")
-            message_alea = bytes([random.randint(0, 255), random.randint(0, 255)])
-            zigbee_header = bytes.fromhex("02412f6891")
-            message_id = bytes([random.randint(0, 255), random.randint(0, 255)])
-            control = b"\x18"
-            
-            payload_macs = dev_mac + b"\x00\x00" + hub_mac
-            payload_tail = bytes.fromhex("08000844150a0109e7a9bae8b083e58a9f000000000001012a40")
-            
-            frame = prefix + message_alea + zigbee_header + message_id + control + payload_macs + payload_tail
-        else:
-            prefix = bytes.fromhex("aa711c44691c0441196891")
-            frame_id = bytes([random.randint(0, 255)])
-            seq = bytes([random.randint(0, 255)])
-            control = b"\x18"
-            
-            frame = prefix + frame_id + seq + control + dev_mac
-            if len(frame) < 34:
-                frame += b"\x00" * (34 - len(frame))
+        prefix = bytes.fromhex("aa711c44691c0441196891")
+        frame_id = bytes([random.randint(0, 255)])
+        seq = bytes([random.randint(0, 255)])
+        control = b"\x18"
+
+        frame = prefix + frame_id + seq + control + dev_mac
+        if len(frame) < 34:
+            frame += b"\x00" * (34 - len(frame))
 
         await self.write_attributes(
             {W100_ATTR: frame},
