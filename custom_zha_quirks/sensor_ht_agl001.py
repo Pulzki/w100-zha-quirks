@@ -171,7 +171,21 @@ class W100ManuSpecificCluster(XiaomiAqaraE1Cluster):
         return self.endpoint.device.ieee.serialize()
 
     async def _write_w100_control_frame(self, payload: bytes) -> None:
-        await super().write_attributes({W100_ATTR: payload}, manufacturer=0x115F)
+        """Write a raw W100 control frame to attribute 0xFFF2.
+
+        Uses write_attributes_raw to bypass the high-level write_attributes
+        size guard, which rejects a single attribute record larger than the
+        link's per-request limit (~50 bytes) -- e.g. the ~60-byte
+        thermostat-mode registration frame.
+        """
+        attr = foundation.Attribute(
+            attrid=t.uint16_t(W100_ATTR),
+            value=foundation.TypeValue(
+                type=t.uint8_t(0x41),  # ZCL octet string -> t.LVBytes
+                value=t.LVBytes(bytes(payload)),
+            ),
+        )
+        await self.write_attributes_raw([attr], manufacturer=0x115F)
 
     async def _set_external_sensor_mode(self, mode: Any) -> None:
         normalized = self._normalize_sensor_mode(mode)
@@ -689,10 +703,7 @@ class W100ManuSpecificCluster(XiaomiAqaraE1Cluster):
         checksum = sum(full_payload) & 0xFF
         full_payload[5] = checksum
 
-        await self.write_attributes(
-            {W100_ATTR: full_payload},
-            manufacturer=0x115F,
-        )
+        await self._write_w100_control_frame(full_payload)
 
     async def set_thermostat_mode(self, mode: str):
         """Set thermostat mode (ON/OFF)."""
@@ -704,31 +715,41 @@ class W100ManuSpecificCluster(XiaomiAqaraE1Cluster):
             if thermostat and isinstance(thermostat, W100ThermostatCluster):
                 thermostat._cached_p = 1 if mode == "OFF" else 0
 
-        if mode == "ON":
-            # The literal "ON" registration frame is ~60 bytes and exceeds the
-            # device link's single-request limit (~50 bytes). The thermostat is
-            # actually enabled by the PMTSD active frame (P=0), which is small
-            # enough to fit, so replay the cached PMTSD instead. _cached_p was
-            # just set to 0 above, so _send_cached_pmtsd will send it.
-            await self._send_cached_pmtsd()
-            return
-
         device_ieee = self.endpoint.device.ieee
         dev_mac = device_ieee.serialize()
+        hub_mac = bytes.fromhex("54ef4480711a")
 
-        prefix = bytes.fromhex("aa711c44691c0441196891")
-        frame_id = bytes([random.randint(0, 255)])
-        seq = bytes([random.randint(0, 255)])
-        control = b"\x18"
+        if mode == "ON":
+            prefix = bytes.fromhex("aa713244")
+            message_alea = bytes([random.randint(0, 255), random.randint(0, 255)])
+            zigbee_header = bytes.fromhex("02412f6891")
+            message_id = bytes([random.randint(0, 255), random.randint(0, 255)])
+            control = b"\x18"
 
-        frame = prefix + frame_id + seq + control + dev_mac
-        if len(frame) < 34:
-            frame += b"\x00" * (34 - len(frame))
+            payload_macs = dev_mac + b"\x00\x00" + hub_mac
+            payload_tail = bytes.fromhex("08000844150a0109e7a9bae8b083e58a9f000000000001012a40")
 
-        await self.write_attributes(
-            {W100_ATTR: frame},
-            manufacturer=0x115F,
-        )
+            frame = prefix + message_alea + zigbee_header + message_id + control + payload_macs + payload_tail
+        else:
+            prefix = bytes.fromhex("aa711c44691c0441196891")
+            frame_id = bytes([random.randint(0, 255)])
+            seq = bytes([random.randint(0, 255)])
+            control = b"\x18"
+
+            frame = prefix + frame_id + seq + control + dev_mac
+            if len(frame) < 34:
+                frame += b"\x00" * (34 - len(frame))
+
+        # Send via the raw helper so the ~60-byte ON registration frame isn't
+        # rejected by the high-level write_attributes size guard.
+        await self._write_w100_control_frame(frame)
+
+        if mode == "ON":
+            # The registration frame enables the device-side thermostat
+            # feature; follow it with the PMTSD active frame (P=0) to set the
+            # actual running state, mirroring the reference quirk. _cached_p was
+            # set to 0 above, so _send_cached_pmtsd will send it.
+            await self._send_cached_pmtsd()
 
     async def apply_custom_configuration(self, *args, **kwargs):
         """Configure the device."""
