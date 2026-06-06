@@ -654,6 +654,9 @@ class W100ManuSpecificCluster(XiaomiAqaraE1Cluster):
         if ep1:
             thermostat = ep1.in_clusters.get(Thermostat.cluster_id)
             if thermostat and hasattr(thermostat, "_cached_p"):
+                 if thermostat._cached_p == 1:
+                     _LOGGER.debug("Skipping PMTSD replay; thermostat is off")
+                     return
                  await self.send_pmtsd(
                     thermostat._cached_p,
                     thermostat._cached_m,
@@ -693,6 +696,14 @@ class W100ManuSpecificCluster(XiaomiAqaraE1Cluster):
 
     async def set_thermostat_mode(self, mode: str):
         """Set thermostat mode (ON/OFF)."""
+        # Pin the thermostat's PMTSD power flag so heartbeat replays can't undo
+        # the mode we're about to set (P=1 means off, P=0 means active).
+        ep1 = self.endpoint.device.endpoints.get(1)
+        if ep1:
+            thermostat = ep1.in_clusters.get(Thermostat.cluster_id)
+            if thermostat and isinstance(thermostat, W100ThermostatCluster):
+                thermostat._cached_p = 1 if mode == "OFF" else 0
+
         device_ieee = self.endpoint.device.ieee
         dev_mac = device_ieee.serialize()
         hub_mac = bytes.fromhex("54ef4480711a")
@@ -753,8 +764,6 @@ class W100ManuSpecificCluster(XiaomiAqaraE1Cluster):
         try:
             await self.bind()
             await self.set_thermostat_mode("OFF")
-            await asyncio.sleep(0.5)
-            await self.set_thermostat_mode("ON")
         except Exception as e:
             _LOGGER.warning("W100: Failed to set thermostat mode: %s", e)
 
