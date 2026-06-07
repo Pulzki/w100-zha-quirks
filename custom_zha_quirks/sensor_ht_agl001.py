@@ -663,14 +663,19 @@ class W100ManuSpecificCluster(XiaomiAqaraE1Cluster):
             thermostat.recalculate_running_state()
 
     async def _send_cached_pmtsd(self):
-        """Send cached PMTSD to device."""
+        """Reply to the device's PMTSD heartbeat/request with the cached state.
+
+        Always reply -- including when the thermostat is off (P=1). The W100
+        firmware reverts to its default thermostat mode if it stops receiving
+        PMTSD replies to its heartbeats, so we must keep sending the off-frame
+        to hold buttons-only mode. _cached_p is pinned by set_thermostat_mode
+        (1=off, 0=active) and seeded to 1 (off), so the replayed frame matches
+        the user's chosen mode rather than re-enabling the thermostat.
+        """
         ep1 = self.endpoint.device.endpoints.get(1)
         if ep1:
             thermostat = ep1.in_clusters.get(Thermostat.cluster_id)
             if thermostat and hasattr(thermostat, "_cached_p"):
-                 if thermostat._cached_p == 1:
-                     _LOGGER.debug("Skipping PMTSD replay; thermostat is off")
-                     return
                  await self.send_pmtsd(
                     thermostat._cached_p,
                     thermostat._cached_m,
