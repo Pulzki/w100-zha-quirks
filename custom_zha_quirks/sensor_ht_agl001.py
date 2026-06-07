@@ -804,14 +804,31 @@ class W100ManuSpecificCluster(XiaomiAqaraE1Cluster):
             _LOGGER.warning("W100: Failed to configure reporting: %s", e)
 
         # Bind the manufacturer cluster so the device reports to us (PMTSD
-        # heartbeats, button events, etc). Do NOT force a thermostat mode here:
-        # apply_custom_configuration runs on every reconfigure, so forcing OFF
-        # (or ON) would override whatever mode the user last set and the device
-        # has persisted. The mode is synced from the device's own PMTSD reports.
+        # heartbeats, button events, etc).
         try:
             await self.bind()
         except Exception as e:
             _LOGGER.warning("W100: Failed to bind manufacturer cluster: %s", e)
+
+        # Re-assert the last-known thermostat-mode-switch state. The device
+        # reverts to its firmware default (thermostat ON) whenever it reconnects
+        # -- e.g. during an HA/ZHA restart, when its heartbeats go unanswered --
+        # so buttons-only mode has to be re-applied on startup. Re-send the
+        # frame matching the user's last choice (the persisted 0xFFF3 value);
+        # default to OFF/buttons-only when it's unknown, consistent with the
+        # system_mode=Off / _cached_p=1 seeds. This re-applies the user's own
+        # choice, so (unlike a hardcoded mode) it doesn't fight reconfigures.
+        try:
+            last_switch = self.get(0xFFF3)
+            mode = "ON" if last_switch else "OFF"
+            _LOGGER.debug(
+                "W100: Re-asserting thermostat mode on init: %s (cached 0xFFF3=%r)",
+                mode,
+                last_switch,
+            )
+            await self.set_thermostat_mode(mode)
+        except Exception as e:
+            _LOGGER.warning("W100: Failed to re-assert thermostat mode: %s", e)
 
         # Sync state
         try:
@@ -942,6 +959,27 @@ class W100ThermostatCluster(CustomCluster, Thermostat):
         self._update_attribute(0x001C, Thermostat.SystemMode.Off)
         self._update_attribute(0x0012, 2000)
         self._update_attribute(0x0011, 2000)
+
+    async def read_attributes(
+        self, attributes, allow_cache=False, only_cache=False, manufacturer=None
+    ):
+        """Serve thermostat attributes from the local cache.
+
+        This is a virtual cluster -- the physical device has no standard
+        Thermostat cluster, so reading it from the device returns nothing and
+        leaves the climate entity 'unknown' (e.g. after a restart). Serve the
+        seeded/synced cache instead of querying the device.
+        """
+        success = {}
+        failure = {}
+        for attr in attributes:
+            attr_id = attr if isinstance(attr, int) else self.attributes_by_name[attr].id
+            value = self.get(attr_id)
+            if value is not None:
+                success[attr_id] = value
+            else:
+                failure[attr_id] = foundation.Status.UNSUPPORTED_ATTRIBUTE
+        return success, failure
 
     def recalculate_running_state(self):
         """Recalculate running state based on temp and setpoint."""
