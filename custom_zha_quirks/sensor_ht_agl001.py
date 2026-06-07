@@ -789,11 +789,12 @@ class W100ManuSpecificCluster(XiaomiAqaraE1Cluster):
                 await temp_cluster.bind()
                 await temp_cluster.configure_reporting(0x0000, 10, 3600, 50)
             
-            # Custom Temp
-            await self.configure_reporting(0x0163, 10, 3600, 100, manufacturer=0x115F)
-            
+            # Custom Temp (manufacturer code is derived from the attribute
+            # definition, which is flagged is_manufacturer_specific=True)
+            await self.configure_reporting(0x0163, 10, 3600, 100)
+
             # Custom Humidity
-            await self.configure_reporting(0x016A, 10, 3600, 100, manufacturer=0x115F)
+            await self.configure_reporting(0x016A, 10, 3600, 100)
             
             # Power
             power_cluster = self.endpoint.in_clusters.get(PowerConfiguration.cluster_id)
