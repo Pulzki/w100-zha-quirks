@@ -147,6 +147,11 @@ class W100ManuSpecificCluster(XiaomiAqaraE1Cluster):
         super().__init__(*args, **kwargs)
         self._cached_external_temperature = self._DEFAULT_EXTERNAL_TEMPERATURE
         self._cached_external_humidity = self._DEFAULT_EXTERNAL_HUMIDITY
+        # Tracks the thermostat *feature* (Thermostat Mode Switch / T symbol),
+        # set by set_thermostat_mode. Drives the switch-aware heartbeat reply.
+        # Default off (buttons-only); re-asserted on init from the persisted
+        # 0xFFF3 value.
+        self._thermostat_feature_on = False
         # Initialize the attribute cache with default values
         self._update_attribute(self.AttributeDefs.external_temperature.id, self._cached_external_temperature)
         self._update_attribute(self.AttributeDefs.external_humidity.id, self._cached_external_humidity)
@@ -539,8 +544,12 @@ class W100ManuSpecificCluster(XiaomiAqaraE1Cluster):
         if idx + 2 >= len(data):
             # Check for heartbeat/request (0x84 command)
             if len(data) >= 4 and data[3] == 0x84:
-                 _LOGGER.debug("W100ManuSpecificCluster: Received heartbeat/request. Replying with cached PMTSD.")
-                 asyncio.create_task(self._send_cached_pmtsd())
+                 _LOGGER.debug(
+                     "W100ManuSpecificCluster: Received heartbeat/request "
+                     "(feature_on=%s).",
+                     self._thermostat_feature_on,
+                 )
+                 asyncio.create_task(self._reply_to_heartbeat())
             return
 
         payload_len = data[idx + 2]
@@ -662,18 +671,30 @@ class W100ManuSpecificCluster(XiaomiAqaraE1Cluster):
             )
             thermostat.recalculate_running_state()
 
-    async def _send_cached_pmtsd(self):
-        """Reply to the device's heartbeat/request with the cached PMTSD frame.
+    async def _reply_to_heartbeat(self):
+        """Reply to the device's PMTSD heartbeat/request, switch-aware.
 
-        This mirrors the Zigbee2MQTT converter (and the reference quirk ported
-        from it): the device's 0x08000844 request is always answered with the
-        stored PMTSD state, unconditionally. Answering keeps the device from
-        reverting to its default; the PMTSD P value reflects the HVAC layer only
-        and does not toggle the thermostat feature (which is changed solely by
-        the explicit ON/OFF frames in set_thermostat_mode). _cached_p is pinned
-        by set_thermostat_mode (1=off, 0=active), by the Thermostat entity's
-        system_mode writes, and seeded to 1 (off), so the reply is an off-frame
-        while off.
+        Hardware testing showed the device only sends these heartbeat requests
+        while it is in thermostat mode, and that it reverts to thermostat mode
+        on its own after a while. So a heartbeat received while the Thermostat
+        Mode Switch is OFF means the device has drifted back into thermostat
+        mode against the user's wish -- replying with PMTSD (any P, including
+        P=1) just keeps it a thermostat (the T stays on the display). Re-assert
+        the unregister/OFF frame instead to kick it back to buttons-only.
+
+        While the switch is ON, reply with the cached PMTSD (HVAC state).
+        """
+        if not self._thermostat_feature_on:
+            _LOGGER.debug("W100: Heartbeat while switch off -- re-asserting OFF frame")
+            await self._write_w100_control_frame(self._build_thermostat_off_frame())
+        else:
+            await self._send_cached_pmtsd()
+
+    async def _send_cached_pmtsd(self):
+        """Send the cached PMTSD frame (current HVAC state) to the device.
+
+        _cached_p is pinned by set_thermostat_mode (1=off, 0=active), by the
+        Thermostat entity's system_mode writes, and seeded to 1 (off).
         """
         ep1 = self.endpoint.device.endpoints.get(1)
         if ep1:
@@ -740,6 +761,8 @@ class W100ManuSpecificCluster(XiaomiAqaraE1Cluster):
         T symbol) via the explicit registration/unregister frames, which is
         distinct from the HVAC system_mode set via the Thermostat entity.
         """
+        self._thermostat_feature_on = mode == "ON"
+
         # Keep the PMTSD power flag roughly in sync with the climate entity
         # (P=1 off / P=0 active). Note this is the HVAC layer, not the feature.
         ep1 = self.endpoint.device.endpoints.get(1)
